@@ -1,0 +1,6 @@
+/udp-loadgen
+*.o
+*.pcap
+*.pcapng
+core
+core.*
