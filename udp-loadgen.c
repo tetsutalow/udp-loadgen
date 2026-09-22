@@ -1,24 +1,30 @@
 #define _GNU_SOURCE
 #define _POSIX_C_SOURCE 200809L
 
+#include "stun_ice.h"
+
 #include <arpa/inet.h>
 #include <errno.h>
 #include <getopt.h>
 #include <inttypes.h>
 #include <math.h>
 #include <net/if.h>
+#include <poll.h>
 #include <signal.h>
 #include <stdbool.h>
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <sys/random.h>
 #include <sys/socket.h>
 #include <time.h>
 #include <unistd.h>
 
 #define MAX_UDP_PAYLOAD 65507U
 #define STAMP_SIZE 16U
+#define RESPONSE_WINDOW 65536U
+#define RESPONSE_BUCKETS 131072U
 
 static volatile sig_atomic_t stop_requested;
 
@@ -34,6 +40,15 @@ struct options {
     int fill;
     int sndbuf;
     const char *interface;
+    const char *sender_ufrag;
+    const char *target_ufrag;
+    const char *target_password;
+    const char *target_password_env;
+    uint32_t priority;
+    bool ice_binding;
+    bool controlling;
+    bool no_response_stats;
+    double response_wait;
     bool spoof_source;
     bool stamp;
     bool quiet;
@@ -93,6 +108,202 @@ static void put_stamp(unsigned char *payload, uint64_t sequence, uint64_t timest
     put_be64(payload + 8, timestamp_ns);
 }
 
+static bool random_bytes(unsigned char *out, size_t length)
+{
+    while (length != 0) {
+        ssize_t received = getrandom(out, length, 0);
+        if (received < 0 && errno == EINTR) {
+            continue;
+        }
+        if (received <= 0) {
+            return false;
+        }
+        out += (size_t)received;
+        length -= (size_t)received;
+    }
+    return true;
+}
+
+struct pending_request {
+    unsigned char txid[12];
+    uint64_t sent_ns;
+    int next;
+    int previous;
+    uint32_t bucket;
+    bool active;
+};
+
+struct response_tracker {
+    struct pending_request *pending;
+    int *heads;
+    size_t cursor;
+    size_t active;
+    uint64_t evicted;
+    uint64_t success;
+    uint64_t error;
+    uint64_t error_401;
+    uint64_t error_487;
+    uint64_t unauthenticated_error;
+    uint64_t invalid;
+    uint64_t unmatched;
+    uint64_t receive_errors;
+    uint64_t rtt_min_ns;
+    uint64_t rtt_max_ns;
+    long double rtt_sum_ns;
+};
+
+static uint32_t txid_bucket(const unsigned char txid[12])
+{
+    uint32_t hash = UINT32_C(2166136261);
+    for (size_t i = 0; i < 12; ++i) {
+        hash = (hash ^ txid[i]) * UINT32_C(16777619);
+    }
+    return hash & (RESPONSE_BUCKETS - 1U);
+}
+
+static bool tracker_init(struct response_tracker *tracker)
+{
+    memset(tracker, 0, sizeof(*tracker));
+    tracker->pending = calloc(RESPONSE_WINDOW, sizeof(*tracker->pending));
+    tracker->heads = malloc(RESPONSE_BUCKETS * sizeof(*tracker->heads));
+    if (tracker->pending == NULL || tracker->heads == NULL) {
+        free(tracker->pending);
+        free(tracker->heads);
+        memset(tracker, 0, sizeof(*tracker));
+        return false;
+    }
+    for (size_t i = 0; i < RESPONSE_BUCKETS; ++i) {
+        tracker->heads[i] = -1;
+    }
+    return true;
+}
+
+static void tracker_remove(struct response_tracker *tracker, int index)
+{
+    struct pending_request *entry = &tracker->pending[index];
+    if (entry->previous >= 0) {
+        tracker->pending[entry->previous].next = entry->next;
+    } else {
+        tracker->heads[entry->bucket] = entry->next;
+    }
+    if (entry->next >= 0) {
+        tracker->pending[entry->next].previous = entry->previous;
+    }
+    entry->active = false;
+    --tracker->active;
+}
+
+static void tracker_insert(struct response_tracker *tracker,
+                           const unsigned char txid[12], uint64_t sent_ns)
+{
+    int index = (int)tracker->cursor;
+    tracker->cursor = (tracker->cursor + 1U) % RESPONSE_WINDOW;
+    struct pending_request *entry = &tracker->pending[index];
+    if (entry->active) {
+        tracker_remove(tracker, index);
+        ++tracker->evicted;
+    }
+    memcpy(entry->txid, txid, sizeof(entry->txid));
+    entry->sent_ns = sent_ns;
+    entry->bucket = txid_bucket(txid);
+    entry->previous = -1;
+    entry->next = tracker->heads[entry->bucket];
+    if (entry->next >= 0) {
+        tracker->pending[entry->next].previous = index;
+    }
+    tracker->heads[entry->bucket] = index;
+    entry->active = true;
+    ++tracker->active;
+}
+
+static int tracker_find(const struct response_tracker *tracker,
+                        const unsigned char txid[12])
+{
+    for (int index = tracker->heads[txid_bucket(txid)]; index >= 0;
+         index = tracker->pending[index].next) {
+        if (memcmp(tracker->pending[index].txid, txid, 12) == 0) {
+            return index;
+        }
+    }
+    return -1;
+}
+
+static void drain_responses(int fd, struct response_tracker *tracker,
+                            const char *target_password, unsigned limit)
+{
+    for (unsigned i = 0; i < limit; ++i) {
+        unsigned char packet[MAX_UDP_PAYLOAD];
+        ssize_t received = recv(fd, packet, sizeof(packet), MSG_DONTWAIT);
+        if (received < 0) {
+            if (errno == EINTR) {
+                continue;
+            }
+            if (errno != EAGAIN && errno != EWOULDBLOCK) {
+                ++tracker->receive_errors;
+            }
+            return;
+        }
+        struct stun_ice_response response;
+        if (!stun_ice_parse_response(packet, (size_t)received,
+                                     target_password, &response)) {
+            ++tracker->invalid;
+            continue;
+        }
+        int index = tracker_find(tracker, response.txid);
+        if (index < 0) {
+            ++tracker->unmatched;
+            continue;
+        }
+        uint64_t now_ns = monotonic_ns();
+        uint64_t rtt_ns = now_ns - tracker->pending[index].sent_ns;
+        tracker_remove(tracker, index);
+        if (tracker->rtt_min_ns == 0 || rtt_ns < tracker->rtt_min_ns) {
+            tracker->rtt_min_ns = rtt_ns;
+        }
+        if (rtt_ns > tracker->rtt_max_ns) {
+            tracker->rtt_max_ns = rtt_ns;
+        }
+        tracker->rtt_sum_ns += rtt_ns;
+        if (response.error_code == 0) {
+            ++tracker->success;
+        } else {
+            ++tracker->error;
+            if (response.error_code == 401) {
+                ++tracker->error_401;
+            }
+            if (response.error_code == 487) {
+                ++tracker->error_487;
+            }
+            if (!response.authenticated) {
+                ++tracker->unauthenticated_error;
+            }
+        }
+    }
+}
+
+static void wait_until_with_responses(int fd, struct response_tracker *tracker,
+                                      const char *target_password, uint64_t deadline_ns)
+{
+    while (!stop_requested) {
+        uint64_t now_ns = monotonic_ns();
+        if (now_ns >= deadline_ns) {
+            break;
+        }
+        uint64_t left_ns = deadline_ns - now_ns;
+        uint64_t timeout_ms64 = left_ns / UINT64_C(1000000) +
+                                (left_ns % UINT64_C(1000000) != 0);
+        int timeout_ms = (int)(timeout_ms64 > INT32_MAX ? INT32_MAX : timeout_ms64);
+        struct pollfd watched = {.fd = fd, .events = POLLIN};
+        int result = poll(&watched, 1, timeout_ms);
+        if (result > 0) {
+            drain_responses(fd, tracker, target_password, 256);
+        } else if (result < 0 && errno != EINTR) {
+            ++tracker->receive_errors;
+            break;
+        }
+    }
+}
+
 static bool is_lab_destination(struct in_addr address)
 {
     uint32_t ip = ntohl(address.s_addr);
@@ -119,19 +330,31 @@ static void usage(FILE *stream, const char *program)
 {
     fprintf(stream,
             "Usage: %s --src-ip ADDR --src-port PORT --dst-ip ADDR\n"
-            "          --dst-port PORT --size BYTES [options]\n\n"
+            "          --dst-port PORT [--size BYTES | --mode ice-binding ...] [options]\n\n"
             "Required:\n"
             "  --src-ip ADDR       Source IPv4 address\n"
             "  --src-port PORT     Source UDP port (0 chooses ephemeral in normal mode)\n"
             "  --dst-ip ADDR       Destination IPv4 address\n"
             "  --dst-port PORT     Destination UDP port (1-65535)\n"
-            "  --size BYTES        UDP payload size (0-%u)\n\n"
+            "  --size BYTES        UDP mode payload size (0-%u)\n"
+            "  --mode MODE         udp (default) or ice-binding\n\n"
             "Load controls:\n"
             "  --pps RATE          Packets per second; 0 means unlimited (default: 1000)\n"
             "  --duration SEC      Stop after seconds; 0 disables (default: 10)\n"
             "  --count PACKETS     Stop after attempts; 0 disables (default: 0)\n"
             "                       When both are set, the first limit wins\n"
             "  --sndbuf BYTES      Request a socket send-buffer size\n\n"
+            "ICE Binding Request mode (no --size, --fill, or --stamp):\n"
+            "  --sender-ufrag TEXT  Sender's ICE username fragment\n"
+            "  --target-ufrag TEXT  Target's ICE username fragment\n"
+            "  --target-password TEXT      Target's ICE password (visible in process list)\n"
+            "  --target-password-env NAME  Read target password from environment variable\n"
+            "  --role ROLE          controlling or controlled (sender's role)\n"
+            "  --priority VALUE     Peer-reflexive priority (default: 0x6e0001ff)\n"
+            "                       ICE mode defaults to 1 pps if --pps is omitted\n\n"
+            "  --response-wait SEC  Collect replies after sending (default: 1; max: 60)\n"
+            "  --no-response-stats  Disable reply parsing during ICE sending\n"
+            "                       Spoof mode cannot receive replies\n\n"
             "Source spoofing (restricted to lab destination ranges):\n"
             "  --spoof-source      Allow a non-local source; requires root/network capability\n"
             "  --interface IFACE   Required output interface in spoof mode\n\n"
@@ -175,10 +398,17 @@ static struct options parse_options(int argc, char **argv)
         .pps = 1000.0,
         .duration = 10.0,
         .fill = 0,
+        .priority = UINT32_C(0x6e0001ff),
+        .response_wait = 1.0,
     };
     bool have_src_port = false;
     bool have_dst_port = false;
     bool have_size = false;
+    bool have_fill = false;
+    bool have_pps = false;
+    bool have_role = false;
+    bool have_priority = false;
+    bool have_response_wait = false;
 
     enum {
         OPT_SRC_IP = 1000,
@@ -195,6 +425,15 @@ static struct options parse_options(int argc, char **argv)
         OPT_INTERFACE,
         OPT_STAMP,
         OPT_QUIET,
+        OPT_MODE,
+        OPT_SENDER_UFRAG,
+        OPT_TARGET_UFRAG,
+        OPT_TARGET_PASSWORD,
+        OPT_TARGET_PASSWORD_ENV,
+        OPT_ROLE,
+        OPT_PRIORITY,
+        OPT_RESPONSE_WAIT,
+        OPT_NO_RESPONSE_STATS,
     };
     static const struct option long_options[] = {
         {"src-ip", required_argument, NULL, OPT_SRC_IP},
@@ -211,6 +450,15 @@ static struct options parse_options(int argc, char **argv)
         {"interface", required_argument, NULL, OPT_INTERFACE},
         {"stamp", no_argument, NULL, OPT_STAMP},
         {"quiet", no_argument, NULL, OPT_QUIET},
+        {"mode", required_argument, NULL, OPT_MODE},
+        {"sender-ufrag", required_argument, NULL, OPT_SENDER_UFRAG},
+        {"target-ufrag", required_argument, NULL, OPT_TARGET_UFRAG},
+        {"target-password", required_argument, NULL, OPT_TARGET_PASSWORD},
+        {"target-password-env", required_argument, NULL, OPT_TARGET_PASSWORD_ENV},
+        {"role", required_argument, NULL, OPT_ROLE},
+        {"priority", required_argument, NULL, OPT_PRIORITY},
+        {"response-wait", required_argument, NULL, OPT_RESPONSE_WAIT},
+        {"no-response-stats", no_argument, NULL, OPT_NO_RESPONSE_STATS},
         {"help", no_argument, NULL, 'h'},
         {NULL, 0, NULL, 0},
     };
@@ -239,6 +487,7 @@ static struct options parse_options(int argc, char **argv)
             break;
         case OPT_PPS:
             opts.pps = parse_double(optarg, "pps");
+            have_pps = true;
             break;
         case OPT_DURATION:
             opts.duration = parse_double(optarg, "duration");
@@ -248,6 +497,7 @@ static struct options parse_options(int argc, char **argv)
             break;
         case OPT_FILL:
             opts.fill = (int)parse_u64(optarg, 255, "fill byte");
+            have_fill = true;
             break;
         case OPT_SNDBUF:
             opts.sndbuf = (int)parse_u64(optarg, INT32_MAX, "send buffer");
@@ -268,6 +518,58 @@ static struct options parse_options(int argc, char **argv)
         case OPT_QUIET:
             opts.quiet = true;
             break;
+        case OPT_MODE:
+            if (strcmp(optarg, "ice-binding") == 0) {
+                opts.ice_binding = true;
+            } else if (strcmp(optarg, "udp") == 0) {
+                opts.ice_binding = false;
+            } else {
+                fprintf(stderr, "Invalid mode: %s\n", optarg);
+                exit(EXIT_FAILURE);
+            }
+            break;
+        case OPT_SENDER_UFRAG:
+            opts.sender_ufrag = optarg;
+            break;
+        case OPT_TARGET_UFRAG:
+            opts.target_ufrag = optarg;
+            break;
+        case OPT_TARGET_PASSWORD:
+            opts.target_password = optarg;
+            break;
+        case OPT_TARGET_PASSWORD_ENV:
+            opts.target_password_env = optarg;
+            break;
+        case OPT_ROLE:
+            if (strcmp(optarg, "controlling") == 0) {
+                opts.controlling = true;
+            } else if (strcmp(optarg, "controlled") == 0) {
+                opts.controlling = false;
+            } else {
+                fprintf(stderr, "Invalid ICE role: %s\n", optarg);
+                exit(EXIT_FAILURE);
+            }
+            have_role = true;
+            break;
+        case OPT_PRIORITY:
+            opts.priority = (uint32_t)parse_u64(optarg, INT32_MAX, "ICE priority");
+            have_priority = true;
+            if (opts.priority == 0) {
+                fputs("ICE priority must be greater than zero.\n", stderr);
+                exit(EXIT_FAILURE);
+            }
+            break;
+        case OPT_RESPONSE_WAIT:
+            opts.response_wait = parse_double(optarg, "response wait");
+            have_response_wait = true;
+            if (opts.response_wait > 60.0) {
+                fputs("Response wait must be 60 seconds or less.\n", stderr);
+                exit(EXIT_FAILURE);
+            }
+            break;
+        case OPT_NO_RESPONSE_STATS:
+            opts.no_response_stats = true;
+            break;
         case 'h':
             usage(stdout, argv[0]);
             exit(EXIT_SUCCESS);
@@ -282,7 +584,7 @@ static struct options parse_options(int argc, char **argv)
         exit(EXIT_FAILURE);
     }
     if (opts.src_ip == NULL || opts.dst_ip == NULL || !have_src_port ||
-        !have_dst_port || !have_size) {
+        !have_dst_port || (!opts.ice_binding && !have_size)) {
         fputs("Missing a required option.\n\n", stderr);
         usage(stderr, argv[0]);
         exit(EXIT_FAILURE);
@@ -293,6 +595,48 @@ static struct options parse_options(int argc, char **argv)
     }
     if (opts.duration == 0.0 && opts.count == 0) {
         fputs("At least one of --duration or --count must be non-zero.\n", stderr);
+        exit(EXIT_FAILURE);
+    }
+    if (opts.ice_binding) {
+        if (have_size || have_fill || opts.stamp) {
+            fputs("--size, --fill, and --stamp are not valid in ICE mode.\n", stderr);
+            exit(EXIT_FAILURE);
+        }
+        if (opts.sender_ufrag == NULL || opts.target_ufrag == NULL || !have_role ||
+            (opts.target_password == NULL && opts.target_password_env == NULL)) {
+            fputs("ICE mode requires --sender-ufrag, --target-ufrag, "
+                  "--role, and a target password.\n", stderr);
+            exit(EXIT_FAILURE);
+        }
+        if (opts.target_password != NULL && opts.target_password_env != NULL) {
+            fputs("Use only one of --target-password and --target-password-env.\n", stderr);
+            exit(EXIT_FAILURE);
+        }
+        if (opts.target_password_env != NULL) {
+            if (opts.target_password_env[0] == '\0') {
+                fputs("Environment variable name cannot be empty.\n", stderr);
+                exit(EXIT_FAILURE);
+            }
+            opts.target_password = getenv(opts.target_password_env);
+            if (opts.target_password == NULL) {
+                fprintf(stderr, "Environment variable is not set: %s\n",
+                        opts.target_password_env);
+                exit(EXIT_FAILURE);
+            }
+        }
+        if (!have_pps) {
+            opts.pps = 1.0;
+        }
+        if ((opts.spoof_source || opts.no_response_stats) && have_response_wait) {
+            fputs("--response-wait requires ICE mode with response stats and "
+                  "a non-spoofed source.\n", stderr);
+            exit(EXIT_FAILURE);
+        }
+    } else if (opts.sender_ufrag != NULL || opts.target_ufrag != NULL ||
+               opts.target_password != NULL || opts.target_password_env != NULL ||
+               have_role || have_priority || have_response_wait ||
+               opts.no_response_stats) {
+        fputs("ICE-specific options require --mode ice-binding.\n", stderr);
         exit(EXIT_FAILURE);
     }
     if (opts.stamp && opts.payload_size < STAMP_SIZE) {
@@ -328,6 +672,33 @@ static struct in_addr parse_ipv4(const char *text, const char *name)
 int main(int argc, char **argv)
 {
     struct options opts = parse_options(argc, argv);
+    struct stun_ice_config ice = {0};
+    if (opts.ice_binding) {
+        unsigned char random_tie_breaker[8];
+        if (!random_bytes(random_tie_breaker, sizeof(random_tie_breaker))) {
+            perror("getrandom(tie-breaker)");
+            return EXIT_FAILURE;
+        }
+        uint64_t tie_breaker = 0;
+        for (size_t i = 0; i < sizeof(random_tie_breaker); ++i) {
+            tie_breaker = (tie_breaker << 8) | random_tie_breaker[i];
+        }
+        ice = (struct stun_ice_config){
+            .sender_ufrag = opts.sender_ufrag,
+            .target_ufrag = opts.target_ufrag,
+            .target_password = opts.target_password,
+            .priority = opts.priority,
+            .tie_breaker = tie_breaker,
+            .controlling = opts.controlling,
+        };
+        opts.payload_size = stun_ice_packet_size(&ice);
+        if (opts.payload_size == 0 || opts.payload_size > MAX_UDP_PAYLOAD) {
+            fputs("Invalid ICE credentials or STUN packet size. "
+                  "Ufrags must be 4-256 ICE characters; password 1-256 bytes.\n",
+                  stderr);
+            return EXIT_FAILURE;
+        }
+    }
     struct sockaddr_in source = {
         .sin_family = AF_INET,
         .sin_port = htons(opts.src_port),
@@ -426,7 +797,9 @@ int main(int argc, char **argv)
         close(fd);
         return EXIT_FAILURE;
     }
-    memset(payload, opts.fill, allocation_size);
+    if (!opts.ice_binding) {
+        memset(payload, opts.fill, allocation_size);
+    }
 
     struct sigaction action = {.sa_handler = on_signal};
     sigemptyset(&action.sa_mask);
@@ -437,10 +810,21 @@ int main(int argc, char **argv)
         return EXIT_FAILURE;
     }
 
+    bool collect_responses = opts.ice_binding && !opts.spoof_source &&
+                             !opts.no_response_stats;
+    struct response_tracker tracker = {0};
+    if (collect_responses && !tracker_init(&tracker)) {
+        perror("response tracker allocation");
+        free(payload);
+        close(fd);
+        return EXIT_FAILURE;
+    }
+
     if (!opts.quiet) {
-        printf("UDP %s:%u -> %s:%u, payload=%zu bytes, mode=%s",
+        printf("UDP %s:%u -> %s:%u, payload=%zu bytes, mode=%s%s",
                effective_src, ntohs(source.sin_port), opts.dst_ip, opts.dst_port,
-               opts.payload_size, opts.spoof_source ? "spoof" : "normal");
+               opts.payload_size, opts.ice_binding ? "ice-binding" : "udp",
+               opts.spoof_source ? "/spoof" : "");
         if (opts.spoof_source) {
             printf("(%s)", opts.interface);
         }
@@ -458,6 +842,9 @@ int main(int argc, char **argv)
         }
         if (opts.count != 0) {
             printf(", count=%" PRIu64, opts.count);
+        }
+        if (opts.ice_binding && !collect_responses) {
+            printf(", response-stats=disabled");
         }
         putchar('\n');
     }
@@ -482,7 +869,12 @@ int main(int argc, char **argv)
             long double offset = (long double)attempts * 1.0e9L / (long double)opts.pps;
             uint64_t target_ns = start_ns + (uint64_t)offset;
             if (now_ns < target_ns) {
-                sleep_until(target_ns);
+                if (collect_responses) {
+                    wait_until_with_responses(fd, &tracker, opts.target_password,
+                                              target_ns);
+                } else {
+                    sleep_until(target_ns);
+                }
                 if (stop_requested) {
                     break;
                 }
@@ -494,7 +886,15 @@ int main(int argc, char **argv)
             }
         }
 
-        if (opts.stamp) {
+        unsigned char txid[12] = {0};
+        if (opts.ice_binding) {
+            if (!random_bytes(txid, sizeof(txid)) ||
+                !stun_ice_build(&ice, txid, payload, opts.payload_size)) {
+                fputs("Could not build ICE Binding Request.\n", stderr);
+                ++errors;
+                break;
+            }
+        } else if (opts.stamp) {
             put_stamp(payload, attempts, now_ns);
         }
         ssize_t result = send(fd, payload, opts.payload_size, 0);
@@ -502,6 +902,9 @@ int main(int argc, char **argv)
         if (result == (ssize_t)opts.payload_size) {
             ++sent;
             bytes += opts.payload_size;
+            if (collect_responses) {
+                tracker_insert(&tracker, txid, monotonic_ns());
+            }
         } else {
             ++errors;
             if (errors <= 5) {
@@ -514,9 +917,21 @@ int main(int argc, char **argv)
                 }
             }
         }
+        if (collect_responses && attempts % 32U == 0) {
+            drain_responses(fd, &tracker, opts.target_password, 256);
+        }
     }
 
     uint64_t end_ns = monotonic_ns();
+    if (collect_responses) {
+        drain_responses(fd, &tracker, opts.target_password, 256);
+        if (!stop_requested && tracker.active != 0 && opts.response_wait > 0.0) {
+            uint64_t wait_ns = (uint64_t)(opts.response_wait * 1.0e9);
+            wait_until_with_responses(fd, &tracker, opts.target_password,
+                                      monotonic_ns() + wait_ns);
+        }
+        drain_responses(fd, &tracker, opts.target_password, 256);
+    }
     double elapsed = (double)(end_ns - start_ns) / 1.0e9;
     double actual_pps = elapsed > 0.0 ? (double)sent / elapsed : 0.0;
     double mbps = elapsed > 0.0 ? (double)bytes * 8.0 / elapsed / 1000000.0 : 0.0;
@@ -524,6 +939,27 @@ int main(int argc, char **argv)
     printf("sent=%" PRIu64 " attempted=%" PRIu64 " errors=%" PRIu64
            " bytes=%" PRIu64 " elapsed=%.6fs average=%.2fpps %.3fMbps\n",
            sent, attempts, errors, bytes, elapsed, actual_pps, mbps);
+
+    if (collect_responses) {
+        uint64_t received = tracker.success + tracker.error;
+        printf("responses: success=%" PRIu64 " error=%" PRIu64
+               " (401=%" PRIu64 " 487=%" PRIu64 " unauthenticated=%" PRIu64 ")"
+               " unanswered=%" PRIu64 " (evicted=%" PRIu64 ")"
+               " invalid=%" PRIu64 " unmatched=%" PRIu64
+               " recv_errors=%" PRIu64 "\n",
+               tracker.success, tracker.error, tracker.error_401, tracker.error_487,
+               tracker.unauthenticated_error,
+               (uint64_t)tracker.active + tracker.evicted, tracker.evicted,
+               tracker.invalid, tracker.unmatched, tracker.receive_errors);
+        if (received != 0) {
+            printf("response_rtt_ms: min=%.3f avg=%.3f max=%.3f\n",
+                   (double)tracker.rtt_min_ns / 1.0e6,
+                   (double)(tracker.rtt_sum_ns / received) / 1.0e6,
+                   (double)tracker.rtt_max_ns / 1.0e6);
+        }
+        free(tracker.pending);
+        free(tracker.heads);
+    }
 
     free(payload);
     close(fd);
